@@ -1,0 +1,7 @@
+node_modules/
+dist/
+workspace/
+test/
+.git/
+.gitignore
+*.md

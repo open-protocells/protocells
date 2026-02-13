@@ -1,0 +1,31 @@
+{
+  "name": "protocells",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Minimal AI agent loop system based on file system",
+  "main": "dist/index.js",
+  "bin": {
+    "protocells": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx --env-file=.env src/index.ts",
+    "dev": "tsx --env-file=.env watch src/index.ts",
+    "test": "pnpm test:mock && pnpm test:features && pnpm test:live",
+    "test:mock": "tsx --test test/mock.test.ts",
+    "test:features": "tsx --test test/features.test.ts",
+    "test:live": "tsx --env-file=.env --test test/live.test.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.74.0",
+    "openai": "^6.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

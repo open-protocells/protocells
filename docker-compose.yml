@@ -1,0 +1,13 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    volumes:
+      - agent-workspace:/workspace
+
+volumes:
+  agent-workspace:
