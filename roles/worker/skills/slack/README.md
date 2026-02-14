@@ -19,6 +19,14 @@ Use the Slack API (proxied through the bridge):
 
 Example: GET http://localhost:3002/api/conversations.history?channel=C01234567
 
+### Handling Insufficient Context
+
+When you read messages and can't find the user's question or don't understand what they're referring to:
+- The user's actual message may be further back in history
+- Use `limit` parameter to fetch more messages: `?channel=XXX&limit=10` (default is only the most recent)
+- If still unclear, keep increasing the limit or use `latest` / `oldest` parameters to paginate
+- Never assume you've seen the full conversation from just 1 message — always check if context is sufficient
+
 ## Replying
 
 Use the reply tool. The source format is: slack:{channel_id}

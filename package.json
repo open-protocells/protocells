@@ -12,7 +12,8 @@
     "build:admin": "cd admin-ui && pnpm install && pnpm build",
     "start": "tsx --env-file=.env src/index.ts",
     "dev": "tsx --env-file=.env watch src/index.ts",
-    "test": "pnpm test:mock && pnpm test:features && pnpm test:live",
+    "test": "pnpm test:unit && pnpm test:mock && pnpm test:features && pnpm test:live",
+    "test:unit": "MINIMAX_API_KEY=test-dummy tsx --test test/text-tool-parsing.test.ts",
     "test:mock": "tsx --test test/mock.test.ts",
     "test:features": "tsx --test test/features.test.ts",
     "test:live": "tsx --env-file=.env --test test/live.test.ts"
