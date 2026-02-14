@@ -5,6 +5,7 @@ import type { Message, LLMResponse } from './types.js';
 export interface RoundSnapshot {
   round: number;
   timestamp: number;
+  /** Only the new messages added this round (user queue msgs + assistant + tool results) */
   messages: Message[];
   response: LLMResponse;
   provider: string;

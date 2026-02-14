@@ -131,6 +131,61 @@ describe('protocells mock tests', () => {
     assert.ok(roles.includes('assistant'), 'context should have assistant messages');
   });
 
+  // ---- History endpoint tests ----
+
+  it('GET /history returns paginated round list', async () => {
+    const { status, body } = await httpGet(container.baseUrl, '/history');
+    assert.equal(status, 200);
+    assert.ok(Array.isArray(body.items), 'should return items array');
+    assert.ok(body.total >= 2, `should have at least 2 rounds, got ${body.total}`);
+    assert.equal(typeof body.offset, 'number');
+    assert.equal(typeof body.limit, 'number');
+
+    // Newest first
+    if (body.items.length >= 2) {
+      assert.ok(body.items[0].round > body.items[1].round, 'should be sorted newest-first');
+    }
+
+    const item = body.items[0];
+    assert.equal(typeof item.round, 'number');
+    assert.equal(typeof item.timestamp, 'number');
+    assert.equal(typeof item.provider, 'string');
+    assert.equal(typeof item.messageCount, 'number');
+    assert.equal(typeof item.toolCallCount, 'number');
+    assert.ok(Array.isArray(item.toolNames), 'should have toolNames array');
+    assert.equal(typeof item.userPreview, 'string', 'should have userPreview string');
+  });
+
+  it('GET /history/:round returns full round detail', async () => {
+    const { status, body } = await httpGet(container.baseUrl, '/history/0');
+    assert.equal(status, 200);
+    assert.equal(body.round, 0);
+    assert.ok(Array.isArray(body.messages), 'should have messages array');
+    assert.ok(body.response, 'should have response object');
+    assert.equal(typeof body.timestamp, 'number');
+    assert.equal(typeof body.provider, 'string');
+
+    const roles = body.messages.map((m: any) => m.role);
+    assert.ok(roles.includes('user'), 'should have user message');
+    assert.ok(roles.includes('assistant'), 'should have assistant message');
+  });
+
+  it('GET /history/:round returns 404 for nonexistent round', async () => {
+    const { status, body } = await httpGet(container.baseUrl, '/history/99999');
+    assert.equal(status, 404);
+    assert.ok(body.error);
+  });
+
+  it('GET /history supports pagination', async () => {
+    const { status, body } = await httpGet(container.baseUrl, '/history?offset=0&limit=1');
+    assert.equal(status, 200);
+    assert.equal(body.items.length, 1, 'should return exactly 1 item');
+    assert.equal(body.limit, 1);
+
+    const { body: body2 } = await httpGet(container.baseUrl, '/history?offset=10000&limit=20');
+    assert.equal(body2.items.length, 0, 'should return empty for offset beyond total');
+  });
+
   it('POST /message rejects empty content', async () => {
     const { status } = await httpPost(container.baseUrl, '/message', {
       content: '',

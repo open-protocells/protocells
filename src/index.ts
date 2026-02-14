@@ -4,87 +4,59 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { initWorkspace } from './init.js';
-import { MessageQueue } from './queue.js';
-import { createServer } from './server.js';
-import { executeLoop, type ExecutorState } from './executor.js';
-import { loadState } from './state.js';
+import { startAdmin } from './admin.js';
 
 const workspacePath = path.resolve(process.argv[2] ?? './workspace');
-const port = parseInt(process.env.PORT ?? '3000', 10);
-process.env.WORKSPACE = workspacePath;
+const agentPort = parseInt(process.env.PORT ?? '3010', 10);
+const adminPort = parseInt(process.env.ADMIN_PORT ?? '3001', 10);
 
-console.log(`[protocells] workspace: ${workspacePath}`);
-console.log(`[protocells] port: ${port}`);
+console.log(`[index] workspace: ${workspacePath}`);
+console.log(`[index] root agent port: ${agentPort}, admin port: ${adminPort}`);
 
-// Initialize workspace if needed
-initWorkspace(workspacePath);
+// 1. Start admin dashboard
+const adminServer = startAdmin({ agentPort, workspacePath, port: adminPort });
 
-// Ensure workspace scripts can resolve npm packages via ESM import()
-// by symlinking workspace/node_modules → app's node_modules
-const appDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const appNodeModules = path.join(appDir, 'node_modules');
-const wsNodeModules = path.join(workspacePath, 'node_modules');
-if (fs.existsSync(appNodeModules) && !fs.existsSync(wsNodeModules)) {
-  fs.symlinkSync(appNodeModules, wsNodeModules, 'dir');
-  console.log(`[protocells] linked ${wsNodeModules} → ${appNodeModules}`);
-}
+// 2. Spawn root agent as child process
+const distDir = path.dirname(fileURLToPath(import.meta.url));
+const agentScript = path.join(distDir, 'agent.js');
 
-// Create message queue
-const queue = new MessageQueue();
-
-// Executor state (shared with server for status endpoint)
-const executorState: ExecutorState = { status: 'waiting' };
-
-// Start HTTP server
-createServer(
-  {
-    queue,
-    workspacePath,
-    getStatus: () => {
-      try {
-        const state = loadState(workspacePath);
-        return {
-          status: executorState.status,
-          round: state.round,
-          provider: state.provider,
-          model: state.model,
-        };
-      } catch {
-        return { status: executorState.status, round: 0, provider: 'unknown' };
-      }
-    },
+const agent = spawn('node', [agentScript, workspacePath], {
+  env: {
+    ...process.env,
+    PORT: String(agentPort),
   },
-  port
-);
-
-// Run skill setup scripts
-const skillsDir = path.join(workspacePath, 'skills');
-if (fs.existsSync(skillsDir)) {
-  for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const setupScript = path.join(skillsDir, entry.name, 'setup.sh');
-    if (!fs.existsSync(setupScript)) continue;
-
-    console.log(`[skills] running setup: ${entry.name}/setup.sh`);
-    const child = spawn('sh', [setupScript], {
-      cwd: path.join(skillsDir, entry.name),
-      env: { ...process.env, AGENT_PORT: String(port) },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    child.stdout.on('data', (d: Buffer) => process.stdout.write(`[${entry.name}] ${d}`));
-    child.stderr.on('data', (d: Buffer) => process.stderr.write(`[${entry.name}] ${d}`));
-    child.on('exit', (code) => {
-      if (code !== 0 && code !== null) {
-        console.error(`[skills] ${entry.name}/setup.sh exited with code ${code}`);
-      }
-    });
-  }
-}
-
-// Start executor loop
-console.log('[protocells] starting agent loop, waiting for first message...');
-executeLoop(workspacePath, queue, executorState).catch((err) => {
-  console.error('[protocells] fatal error:', err);
-  process.exit(1);
+  stdio: 'inherit',
 });
+
+agent.on('exit', (code, signal) => {
+  console.error(`[index] root agent exited: code=${code} signal=${signal}`);
+  process.exit(code ?? 1);
+});
+
+process.on('SIGTERM', () => {
+  agent.kill('SIGTERM');
+  adminServer.close();
+});
+
+// 3. Wait for agent ready, register admin route
+(async () => {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://localhost:${agentPort}/status`);
+      if (res.ok) break;
+    } catch {
+      // Agent not ready yet
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  const routesPath = path.join(workspacePath, 'routes.json');
+  try {
+    const routes = JSON.parse(fs.readFileSync(routesPath, 'utf-8'));
+    routes['admin'] = { url: `http://localhost:${adminPort}/api/reply` };
+    fs.writeFileSync(routesPath, JSON.stringify(routes, null, 2));
+    console.log('[index] admin route registered');
+  } catch (err) {
+    console.error('[index] failed to register admin route:', err);
+  }
+})();

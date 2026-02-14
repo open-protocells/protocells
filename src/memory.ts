@@ -304,33 +304,12 @@ export async function compressContext(
     }
   }
 
-  // If multiple chunks, merge summaries
-  let summary: string;
-  if (partialSummaries.length === 1) {
-    summary = partialSummaries[0];
-  } else {
-    try {
-      const mergeResponse = await provider.chat(
-        [
-          {
-            role: 'system',
-            content: 'Merge these partial conversation summaries into one cohesive summary. Preserve all key information, decisions, and open items.',
-          },
-          {
-            role: 'user',
-            content: partialSummaries.map((s, i) => `--- Part ${i + 1} ---\n${s}`).join('\n\n'),
-          },
-        ],
-        [],
-        {}
-      );
-      summary = mergeResponse.content ?? partialSummaries.join('\n\n');
-    } catch {
-      summary = partialSummaries.join('\n\n');
-    }
-  }
+  // Concatenate chunk summaries (no merge LLM call — raw info is in round logs)
+  const summary = partialSummaries.length === 1
+    ? partialSummaries[0]
+    : partialSummaries.map((s, i) => `### Part ${i + 1}\n${s}`).join('\n\n');
 
-  // Persist summary to disk
+  // Append to summary.md
   const summaryPath = path.join(workspacePath, 'memory', 'summary.md');
   const existing = fs.existsSync(summaryPath) ? fs.readFileSync(summaryPath, 'utf-8') : '';
   fs.writeFileSync(summaryPath, existing + '\n\n---\n\n' + summary);

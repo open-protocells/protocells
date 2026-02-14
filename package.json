@@ -8,7 +8,8 @@
     "protocells": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "pnpm build:admin && tsc",
+    "build:admin": "cd admin-ui && pnpm install && pnpm build",
     "start": "tsx --env-file=.env src/index.ts",
     "dev": "tsx --env-file=.env watch src/index.ts",
     "test": "pnpm test:mock && pnpm test:features && pnpm test:live",
@@ -21,6 +22,8 @@
   "license": "ISC",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.74.0",
+    "@slack/socket-mode": "^2.0.5",
+    "@slack/web-api": "^7.6.0",
     "openai": "^6.21.0"
   },
   "devDependencies": {

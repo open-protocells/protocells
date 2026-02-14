@@ -3,6 +3,18 @@ import path from 'node:path';
 import { writeOutbox } from './server.js';
 import type { Message, ToolScript } from './types.js';
 
+const TOOL_TIMEOUT_MS = 30_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, toolName: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Tool "${toolName}" timed out after ${ms}ms`)), ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 export interface ToolCallResult {
   messages: Message[];
   shouldWait: boolean;
@@ -25,9 +37,12 @@ export async function executeToolCall(
     const replySource = String(args.source ?? '');
     const replyContent = String(args.content ?? '');
     try {
-      await deliverReply(workspacePath, replySource, replyContent);
+      const delivery = await deliverReply(workspacePath, replySource, replyContent);
       console.log(`[reply] → ${replySource}: ${replyContent.slice(0, 80)}`);
-      return { messages: [{ role: 'tool', content: `Reply delivered to ${replySource}`, toolCallId: call.id }], shouldWait: false };
+      const dest = delivery.destination === 'route'
+        ? `Reply delivered to ${replySource} via ${delivery.url}`
+        : `Reply written to outbox for ${replySource} (no route matched)`;
+      return { messages: [{ role: 'tool', content: dest, toolCallId: call.id }], shouldWait: false };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error(`[reply] delivery error: ${errMsg}`);
@@ -46,7 +61,7 @@ export async function executeToolCall(
   }
 
   try {
-    const result = await tool.execute(call.args);
+    const result = await withTimeout(tool.execute(call.args), TOOL_TIMEOUT_MS, call.name);
     return {
       messages: [{ role: 'tool', content: result.result, toolCallId: call.id }],
       shouldWait: result.action === 'wait',
@@ -76,7 +91,12 @@ function loadRoutes(workspacePath: string): Record<string, { url: string }> {
  * Looks up source prefix in routes.json → POST to registered URL.
  * Falls back to outbox if no route matches.
  */
-async function deliverReply(workspacePath: string, source: string, content: string): Promise<void> {
+interface DeliveryResult {
+  destination: 'route' | 'outbox';
+  url?: string;
+}
+
+async function deliverReply(workspacePath: string, source: string, content: string): Promise<DeliveryResult> {
   const routes = loadRoutes(workspacePath);
 
   const colonIdx = source.indexOf(':');
@@ -92,9 +112,10 @@ async function deliverReply(workspacePath: string, source: string, content: stri
     if (!res.ok) {
       throw new Error(`Route POST to ${route.url} failed: ${res.status} ${await res.text()}`);
     }
-    return;
+    return { destination: 'route', url: route.url };
   }
 
   // Default: write to outbox
   writeOutbox(workspacePath, { source, content });
+  return { destination: 'outbox' };
 }

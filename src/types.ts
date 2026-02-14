@@ -67,12 +67,7 @@ export interface AgentState {
   round: number;
   maxRounds?: number;
   systemPrompt: string;
-}
-
-// === Repair Config ===
-
-export interface RepairConfig {
-  systemPrompt: string;
+  role?: string;
 }
 
 // === Outbox ===

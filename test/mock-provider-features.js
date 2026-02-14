@@ -230,7 +230,6 @@ function spawnScenario() {
             'cp -r /workspace/scripts /workspace-child/ && ' +
             'cp -r /workspace/skills /workspace-child/ && ' +
             'cp /workspace/agent.json /workspace-child/ && ' +
-            'cp /workspace/repair.json /workspace-child/ && ' +
             'mkdir -p /workspace-child/memory /workspace-child/history /workspace-child/outbox && ' +
             "echo '[]' > /workspace-child/memory/context.json && " +
             'echo CLONE_OK',
@@ -255,7 +254,7 @@ function spawnFollowUp(messages, source) {
 
   // Did we already start the child agent?
   const alreadyStarted = assistantMsgs.some(
-    (m) => m.toolCalls?.some((tc) => tc.name === 'bash' && tc.args?.command?.includes('dist/index.js /workspace-child'))
+    (m) => m.toolCalls?.some((tc) => tc.name === 'bash' && tc.args?.command?.includes('dist/agent.js /workspace-child'))
   );
 
   if (!alreadyStarted) {
@@ -269,7 +268,7 @@ function spawnFollowUp(messages, source) {
           args: {
             path: '/workspace/routes.json',
             content: JSON.stringify({
-              'mock-im': { url: 'http://localhost:3001/reply' },
+              'admin': { url: 'http://localhost:3001/api/reply' },
               'child-1': { url: 'http://localhost:' + CHILD_PORT + '/message' },
             }, null, 2),
           },
@@ -278,7 +277,7 @@ function spawnFollowUp(messages, source) {
           id: `spawn-start-${callCount}`,
           name: 'bash',
           args: {
-            command: 'PORT=' + CHILD_PORT + ' node /app/dist/index.js /workspace-child',
+            command: 'PORT=' + CHILD_PORT + ' node /app/dist/agent.js /workspace-child',
             async: true,
           },
         },
@@ -346,7 +345,7 @@ function spawnChildReply(messages, source) {
   // Child replied. Extract the bash job id to kill the child.
   const toolResults = messages.filter((m) => m.role === 'tool');
   const asyncResult = toolResults.find((m) =>
-    m.content?.includes('running in background') && m.content?.includes('dist/index.js')
+    m.content?.includes('running in background') && m.content?.includes('dist/agent.js')
   );
   const jobIdMatch = asyncResult?.content?.match(/job: ([a-f0-9]+)/);
   const jobId = jobIdMatch?.[1] || 'unknown';
@@ -360,49 +359,6 @@ function spawnChildReply(messages, source) {
       { id: `spawn-kill-${callCount}`, name: 'bash_kill', args: { id: jobId } },
       { id: `spawn-reply-${callCount}`, name: 'reply', args: { source: origSource, content: 'SPAWN_COMPLETE' } },
       { id: `spawn-wait-${callCount}`, name: 'wait_for', args: {} },
-    ],
-    usage: { input: 10, output: 10 },
-  };
-}
-
-// ---- Repair scenario ----
-
-const FIXED_PROVIDER = `
-export default {
-  async chat(messages, tools, config) {
-    const userMsgs = messages.filter(m => m.role === 'user' && typeof m.content === 'string');
-    const lastUser = userMsgs[userMsgs.length - 1];
-    const source = lastUser?.content?.match(/^\\[([^\\]]+)\\]/)?.[1] || 'unknown';
-    return {
-      content: null,
-      toolCalls: [
-        { id: 'repaired-reply', name: 'reply', args: { source, content: 'REPAIR_WORKED' } },
-        { id: 'repaired-wait', name: 'wait_for', args: {} },
-      ],
-      usage: { input: 0, output: 0 },
-    };
-  },
-};
-`.trim();
-
-function handleRepair(messages) {
-  // Check if we already have a tool result (meaning we already did read_file)
-  const hasToolResult = messages.some((m) => m.role === 'tool');
-  if (!hasToolResult) {
-    // First call: read the broken provider
-    return {
-      content: null,
-      toolCalls: [
-        { id: `repair-read-${callCount}`, name: 'read_file', args: { path: '/workspace/scripts/providers/mock-features.js' } },
-      ],
-      usage: { input: 10, output: 10 },
-    };
-  }
-  // Second call: write the fixed provider
-  return {
-    content: null,
-    toolCalls: [
-      { id: `repair-write-${callCount}`, name: 'write_file', args: { path: '/workspace/scripts/providers/mock-features.js', content: FIXED_PROVIDER } },
     ],
     usage: { input: 10, output: 10 },
   };
@@ -473,12 +429,6 @@ export default {
   async chat(messages, tools, config) {
     callCount++;
 
-    // Detect repair mode: user messages contain [system:repair]
-    const isRepair = messages.some(
-      (m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('[system:repair]')
-    );
-    if (isRepair) return handleRepair(messages);
-
     const lastMsg = messages[messages.length - 1];
 
     // Find last user message
@@ -523,6 +473,21 @@ export default {
     if (text.includes('ROUTE_BRIDGE_TEST')) return routeBridgeScenario(source);
     if (text.includes('MODEL_SWITCH_TEST')) return modelSwitchScenario();
     if (text.includes('SPAWN_TEST')) return spawnScenario();
+
+    // ROLE_PROMPT_TEST: check if system prompt includes role-specific content
+    if (text.includes('ROLE_PROMPT_TEST')) {
+      const systemMsg = messages.find(m => m.role === 'system');
+      const hasWorkerPrompt = systemMsg?.content?.includes('Worker Agent') ?? false;
+      const hasWorkspacePath = systemMsg?.content?.includes('Your workspace directory is') ?? false;
+      return {
+        content: null,
+        toolCalls: [
+          { id: `role-reply-${callCount}`, name: 'reply', args: { source, content: `ROLE_PROMPT_CHECK:worker=${hasWorkerPrompt}:workspace=${hasWorkspacePath}` } },
+          { id: `role-wait-${callCount}`, name: 'wait_for', args: {} },
+        ],
+        usage: { input: 10, output: 10 },
+      };
+    }
 
     // Default: echo reply + wait_for
     return {

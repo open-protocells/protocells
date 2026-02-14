@@ -8,9 +8,9 @@ const IMAGE_NAME = 'protocells-test';
 export interface ContainerInfo {
   id: string;
   port: number;
-  bridgePort: number;
+  adminPort: number;
   baseUrl: string;
-  bridgeUrl: string;
+  adminUrl: string;
 }
 
 // Build Docker image (once)
@@ -32,21 +32,32 @@ export function startContainer(opts: {
   provider?: string; // Switch agent.json to this provider (e.g. 'minimax', 'openai')
 }): ContainerInfo {
   const port = opts.port ?? 3000 + Math.floor(Math.random() * 1000);
-  const bridgePort = port + 1;
+  const adminPort = port + 1;
   const envFlags = Object.entries(opts.env ?? {})
     .map(([k, v]) => `-e "${k}=${v}"`)
     .join(' ');
 
   // Start container (no --rm so we can inspect after crashes)
+  // index.js = orchestrator (admin + agent). Pass PORT=3000 so agent listens on 3000.
   const id = execSync(
-    `docker run -d -p ${port}:3000 -p ${bridgePort}:3001 ${envFlags} ${IMAGE_NAME}`,
+    `docker run -d -p ${port}:3000 -p ${adminPort}:3001 -e PORT=3000 -e ADMIN_PORT=3001 ${envFlags} ${IMAGE_NAME} node dist/index.js /workspace`,
     { encoding: 'utf-8', cwd: PROJECT_ROOT }
   ).trim();
 
-  console.log(`[test] container started: ${id.slice(0, 12)} on port ${port} (bridge: ${bridgePort})`);
+  console.log(`[test] container started: ${id.slice(0, 12)} on port ${port} (admin: ${adminPort})`);
 
-  // Wait for workspace init + HTTP server
-  execSync('sleep 2');
+  // Wait for agent HTTP server to be ready (polls /status)
+  const agentUrl = `http://localhost:${port}`;
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    try {
+      const res = execSync(`curl -sf ${agentUrl}/status`, { encoding: 'utf-8', timeout: 2_000 });
+      if (res.includes('status')) break;
+    } catch {
+      // Not ready yet
+    }
+    execSync('sleep 0.5');
+  }
 
   if (opts.mockProvider) {
     // Copy all test/mock-provider*.js → providers/mock*.js
@@ -66,9 +77,9 @@ export function startContainer(opts: {
   return {
     id,
     port,
-    bridgePort,
+    adminPort,
     baseUrl: `http://localhost:${port}`,
-    bridgeUrl: `http://localhost:${bridgePort}`,
+    adminUrl: `http://localhost:${adminPort}`,
   };
 }
 
@@ -123,11 +134,11 @@ export async function httpDelete(baseUrl: string, urlPath: string): Promise<{ st
 }
 
 // Wait for server to be ready
-export async function waitForReady(baseUrl: string, timeoutMs = 15_000): Promise<void> {
+export async function waitForReady(baseUrl: string, timeoutMs = 15_000, statusPath = '/status'): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`${baseUrl}/status`);
+      const res = await fetch(`${baseUrl}${statusPath}`);
       if (res.ok) return;
     } catch {
       // Not ready yet
@@ -172,15 +183,15 @@ export function sleep(ms: number): Promise<void> {
 }
 
 // Poll bridge messages until an assistant reply appears
-export async function pollBridgeReply(
-  bridgeUrl: string,
+export async function pollAdminReply(
+  adminUrl: string,
   sessionId: string,
   timeoutMs: number = 60_000
 ): Promise<any> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const { body } = await httpGet(bridgeUrl, `/messages?session=${sessionId}`);
+      const { body } = await httpGet(adminUrl, `/api/messages?session=${sessionId}`);
       if (Array.isArray(body)) {
         const reply = body.find((m: any) => m.role === 'assistant');
         if (reply) return reply;
@@ -191,6 +202,21 @@ export async function pollBridgeReply(
     await sleep(1000);
   }
   throw new Error(`No bridge reply within ${timeoutMs}ms`);
+}
+
+// Poll status until a predicate is true
+export async function pollStatus(
+  baseUrl: string,
+  predicate: (status: any) => boolean,
+  timeoutMs: number = 30_000
+): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const { body } = await httpGet(baseUrl, '/status');
+    if (predicate(body)) return body;
+    await sleep(500);
+  }
+  throw new Error(`Status predicate not met within ${timeoutMs}ms`);
 }
 
 // Read a file from inside the container

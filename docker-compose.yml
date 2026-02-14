@@ -2,12 +2,16 @@ services:
   agent:
     build: .
     ports:
-      - "3000:3000"
+      - "3001:3001"   # admin dashboard (only external port)
+    env_file:
+      - .env
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - PORT=3010
+      - ADMIN_PORT=3001
+      - SPAWN_WORKER=true
     volumes:
       - agent-workspace:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock  # for self-update skill
 
 volumes:
   agent-workspace:

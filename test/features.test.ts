@@ -1,6 +1,7 @@
 import { describe, it, before, after } from 'node:test';
 import { execSync } from 'node:child_process';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import {
   buildImage,
   startContainer,
@@ -11,6 +12,7 @@ import {
   httpDelete,
   pollOutbox,
   pollRound,
+  pollStatus,
   sleep,
   dockerReadFile,
   dockerLogs,
@@ -34,7 +36,7 @@ describe('protocells feature tests', () => {
       provider: 'mock-features',
     });
     await waitForReady(container.baseUrl);
-    await waitForReady(container.bridgeUrl);
+    await waitForReady(container.adminUrl, 15_000, '/api/status');
   });
 
   after(() => {
@@ -145,7 +147,7 @@ describe('protocells feature tests', () => {
 
   // ---- Test 3: Reply routing ----
 
-  it('reply routing: mock-im routes to bridge, other sources route to outbox', async () => {
+  it('reply routing: admin routes to bridge, other sources route to outbox', async () => {
     await clearOutbox(container.baseUrl);
     const { body: status } = await httpGet(container.baseUrl, '/status');
     const startRound = status.round;
@@ -154,15 +156,15 @@ describe('protocells feature tests', () => {
 
     await httpPost(container.baseUrl, '/message', {
       content: 'ROUTE_BRIDGE_TEST please',
-      source: `mock-im:${testSessionId}`,
+      source: `admin:${testSessionId}`,
     });
 
     await pollRound(container.baseUrl, startRound + 1, 15_000);
 
     // Bridge should have the reply
     const { body: bridgeMessages } = await httpGet(
-      container.bridgeUrl,
-      `/messages?session=${testSessionId}`
+      container.adminUrl,
+      `/api/messages?session=${testSessionId}`
     );
     const bridgeReply = bridgeMessages.find(
       (m: any) => m.role === 'assistant' && m.content?.includes('BRIDGE_ROUTED_REPLY')
@@ -175,10 +177,10 @@ describe('protocells feature tests', () => {
     assert.ok(outboxReply, 'outbox should have reply for test-outbox:1');
     assert.ok(outboxReply.content.includes('OUTBOX_ROUTED_REPLY'), 'should contain OUTBOX_ROUTED_REPLY');
 
-    // routes.json should have mock-im entry
+    // routes.json should have admin entry
     const routes = JSON.parse(dockerReadFile(container.id, '/workspace/routes.json'));
-    assert.ok(routes['mock-im'], 'routes.json should have mock-im entry');
-    assert.ok(routes['mock-im'].url.includes('3001'), 'mock-im route should point to bridge port');
+    assert.ok(routes['admin'], 'routes.json should have admin entry');
+    assert.ok(routes['admin'].url.includes('3001'), 'admin route should point to bridge port');
   });
 
   // ---- Test 4: bash_kill cancels background job ----
@@ -337,12 +339,83 @@ describe('protocells feature tests', () => {
     assert.ok(childMsg, 'context should have child-1: message from child reply');
   });
 
-  // ---- Test 8: Repair agent fixes broken provider ----
+  // ---- Test 8: Boot context guard ----
 
-  it('repair agent: fixes broken provider script and resumes processing', async () => {
+  it('boot context guard: worker clears inherited system:boot from context', async () => {
+    const childPort = 3198;
+    const wsPath = '/workspace-boot-test';
+
+    // Create a workspace that simulates a bad clone (context.json has system:boot messages)
+    execSync(
+      `docker exec ${container.id} sh -c "` +
+        `mkdir -p ${wsPath}/memory ${wsPath}/history ${wsPath}/outbox && ` +
+        `cp -r /workspace/scripts ${wsPath}/ && ` +
+        `cp -r /workspace/skills ${wsPath}/ && ` +
+        `cp /workspace/agent.json ${wsPath}/ && ` +
+        `echo '{}' > ${wsPath}/routes.json"`,
+      { timeout: 5_000 }
+    );
+
+    // Write polluted context with system:boot message using node to avoid shell quoting issues
+    execSync(
+      `docker exec ${container.id} node -e "` +
+        `require('fs').writeFileSync('${wsPath}/memory/context.json', JSON.stringify([` +
+        `{role:'user',content:'[system:boot] System booted. You are the root agent.'},` +
+        `{role:'assistant',content:null,toolCalls:[{id:'b1',name:'think',args:{thought:'spawn'}}]},` +
+        `{role:'tool',content:'OK',toolCallId:'b1'}` +
+        `]))"`,
+      { timeout: 5_000 }
+    );
+
+    // Verify pre-condition: context has system:boot
+    const beforeCtx = dockerReadFile(container.id, `${wsPath}/memory/context.json`);
+    assert.ok(beforeCtx.includes('system:boot'), 'pre-condition: context should have system:boot');
+
+    // Start agent WITHOUT SPAWN_WORKER (simulating a worker)
+    execSync(
+      `docker exec -d ${container.id} sh -c "PORT=${childPort} node /app/dist/agent.js ${wsPath}"`,
+      { timeout: 5_000 }
+    );
+
+    // Wait for agent to start (context guard runs synchronously before server starts)
+    const deadline = Date.now() + 10_000;
+    let ready = false;
+    while (Date.now() < deadline) {
+      try {
+        const res = execSync(
+          `docker exec ${container.id} curl -sf http://localhost:${childPort}/status`,
+          { encoding: 'utf-8', timeout: 2_000 }
+        );
+        if (res.includes('status')) { ready = true; break; }
+      } catch { /* not ready yet */ }
+      await sleep(500);
+    }
+    assert.ok(ready, 'boot-test agent should become ready');
+
+    // context.json should be cleared (boot guard removed system:boot messages)
+    const afterCtx = dockerReadFile(container.id, `${wsPath}/memory/context.json`);
+    const parsed = JSON.parse(afterCtx);
+    assert.deepEqual(parsed, [], 'context should be empty after boot guard cleared system:boot messages');
+
+    // Clean up: kill the child agent
+    execSync(
+      `docker exec ${container.id} sh -c "ps aux | grep 'workspace-boot-test' | grep -v grep | awk '{print \\$2}' | xargs kill 2>/dev/null || true"`,
+      { timeout: 5_000 }
+    );
+  });
+
+  // ---- Test 9: Error state + external repair (was Test 8) ----
+
+  it('error state: worker enters error state, external fix + repair-signal resumes', async () => {
     await clearOutbox(container.baseUrl);
     const { body: status } = await httpGet(container.baseUrl, '/status');
     const startRound = status.round;
+
+    // Save the working provider to a temp path inside the container
+    execSync(
+      `docker exec ${container.id} cp /workspace/scripts/providers/mock-features.js /tmp/mock-features-backup.js`,
+      { timeout: 5_000 }
+    );
 
     // Corrupt the provider script with invalid JS
     execSync(
@@ -350,41 +423,326 @@ describe('protocells feature tests', () => {
       { timeout: 5_000 }
     );
 
-    // Send a message — executor will fail to load the broken provider → enter repair mode
+    // Send a message — executor will fail to load the broken provider → enter error state
     await httpPost(container.baseUrl, '/message', {
       content: 'REPAIR_TEST please',
       source: 'test-repair:1',
     });
 
-    // Wait for repair + processing (repair fixes the script, then executor resumes)
+    // Poll /status until status === 'error'
+    const errorStatus = await pollStatus(
+      container.baseUrl,
+      (s) => s.status === 'error',
+      15_000
+    );
+    assert.equal(errorStatus.status, 'error', 'status should be error');
+    assert.ok(errorStatus.error, 'error details should be present');
+    assert.equal(errorStatus.error.source, 'script_load', 'error source should be script_load');
+
+    // Restore the working provider from backup
+    execSync(
+      `docker exec ${container.id} cp /tmp/mock-features-backup.js /workspace/scripts/providers/mock-features.js`,
+      { timeout: 5_000 }
+    );
+
+    // Signal the worker to resume
+    await httpPost(container.baseUrl, '/repair-signal', {});
+
+    // Wait for the executor to resume and process the queued message
     await pollRound(container.baseUrl, startRound + 1, 20_000);
 
-    // Verify reply was delivered (the fixed minimal provider echoes REPAIR_WORKED)
-    const outbox = await pollOutbox(container.baseUrl, 1, 5_000);
-    const reply = outbox.find((m: any) => m.source === 'test-repair:1');
-    assert.ok(reply, 'should have reply after repair');
-    assert.ok(reply.content.includes('REPAIR_WORKED'), 'reply should contain REPAIR_WORKED');
+    // Verify the agent recovered and processed the message
+    const recoveredStatus = await pollStatus(
+      container.baseUrl,
+      (s) => s.status === 'waiting' || s.status === 'running',
+      10_000
+    );
+    assert.notEqual(recoveredStatus.status, 'error', 'status should no longer be error');
 
-    // Verify container logs show repair was triggered
+    // Verify container logs show error state was entered
     const logs = dockerLogs(container.id);
-    assert.ok(logs.includes('[repair]'), 'logs should contain [repair] entries');
-    assert.ok(logs.includes('scripts fixed successfully'), 'logs should confirm repair success');
+    assert.ok(logs.includes('entering error state'), 'logs should show entering error state');
+    assert.ok(logs.includes('repair signal detected'), 'logs should show repair signal detected');
+  });
 
-    // Verify repair context was persisted
-    const repairCtx = JSON.parse(
-      dockerReadFile(container.id, '/.repair/context.json')
-    );
-    assert.ok(Array.isArray(repairCtx), 'repair context should be an array');
-    assert.ok(repairCtx.length > 0, 'repair context should have messages');
-    const repairUserMsg = repairCtx.find(
-      (m: any) => m.role === 'user' && m.content?.includes('[system:repair]')
-    );
-    assert.ok(repairUserMsg, 'repair context should contain system:repair message');
+  // ---- Test 9: Admin status endpoint ----
 
-    // Verify repair history was saved
-    const repairHistoryExists = dockerReadFile(
-      container.id, '/.repair/history/repair-00000.json'
+  it('admin status: GET /api/status returns admin info', async () => {
+    const { status, body } = await httpGet(container.adminUrl, '/api/status');
+    assert.equal(status, 200);
+    assert.equal(body.admin, true, 'should identify as admin');
+    assert.equal(body.port, 3001, 'should report port 3001');
+    assert.equal(body.agentPort, 3000, 'should report agent port 3000');
+  });
+
+  // ---- Test 10: Admin agents discovery ----
+
+  it('admin agents: GET /api/agents returns discovered agents', async () => {
+    const { status, body } = await httpGet(container.adminUrl, '/api/agents');
+    assert.equal(status, 200);
+    assert.ok(Array.isArray(body), 'should return array');
+    assert.ok(body.length >= 1, 'should have at least the root agent');
+
+    const root = body.find((a: any) => a.name === 'root');
+    assert.ok(root, 'should have root agent');
+    assert.equal(root.online, true, 'root agent should be online');
+    assert.ok(root.status, 'root agent should have status');
+  });
+
+  // ---- Test 11: Admin system-info endpoint ----
+
+  it('admin system-info: GET /api/system-info returns monitoring data', async () => {
+    const { status, body } = await httpGet(container.adminUrl, '/api/system-info');
+    assert.equal(status, 200);
+    assert.ok(body.memory, 'should have memory info');
+    assert.ok(body.memory.system.total > 0, 'should have system total memory');
+    assert.ok(body.memory.process.rss > 0, 'should have process RSS');
+    assert.ok(body.uptime, 'should have uptime info');
+    assert.ok(body.uptime.process > 0, 'should have process uptime');
+    assert.ok(body.platform, 'should have platform info');
+  });
+
+  // ---- Admin history proxy tests ----
+
+  it('admin history proxy: GET /api/history returns agent history', async () => {
+    const { status, body } = await httpGet(container.adminUrl, '/api/history?agent=root');
+    assert.equal(status, 200);
+    assert.ok(Array.isArray(body.items), 'should return items array');
+    assert.ok(body.total >= 1, `should have at least 1 round, got ${body.total}`);
+  });
+
+  it('admin history proxy: GET /api/history/:round returns detail', async () => {
+    const { status, body } = await httpGet(container.adminUrl, '/api/history/0?agent=root');
+    assert.equal(status, 200);
+    assert.equal(body.round, 0);
+    assert.ok(Array.isArray(body.messages), 'should have messages');
+  });
+
+  it('admin history proxy: unknown agent returns 404', async () => {
+    const { status, body } = await httpGet(container.adminUrl, '/api/history?agent=nonexistent');
+    assert.equal(status, 404);
+    assert.ok(body.error);
+  });
+
+  // ---- Admin chat sends to agent and receives reply ----
+
+  it('admin chat: POST /api/send forwards to agent and reply arrives', async () => {
+    const sessionId = 'admin-chat-test-' + Date.now();
+
+    // Send via admin
+    const { status } = await httpPost(container.adminUrl, '/api/send', {
+      session: sessionId,
+      content: 'Hello from admin chat',
+    });
+    assert.equal(status, 200);
+
+    // Poll admin messages for the agent's reply
+    const deadline = Date.now() + 30_000;
+    let replyFound = false;
+    while (Date.now() < deadline) {
+      const { body: messages } = await httpGet(
+        container.adminUrl,
+        `/api/messages?session=${sessionId}`
+      );
+      const reply = messages.find((m: any) => m.role === 'assistant');
+      if (reply) {
+        replyFound = true;
+        assert.ok(reply.content.length > 0, 'reply should have content');
+        break;
+      }
+      await sleep(1000);
+    }
+    assert.ok(replyFound, 'should receive agent reply through admin chat');
+  });
+
+  // ---- Role Template Tests ----
+
+  it('role template: worker workspace has correct skills and config', async () => {
+    // The container was started without SPAWN_WORKER, so it initialized as a worker
+    const agentJson = JSON.parse(dockerReadFile(container.id, '/workspace/agent.json'));
+    assert.equal(agentJson.role, 'worker', 'agent.json should have role: worker');
+
+    // prompt.md should have worker content
+    const promptMd = dockerReadFile(container.id, '/workspace/prompt.md');
+    assert.ok(promptMd.includes('Worker Agent'), 'prompt.md should contain Worker Agent');
+    assert.ok(!promptMd.includes('Root Coordinator'), 'prompt.md should NOT contain Root Coordinator');
+
+    // Worker skills should exist
+    const skillsList = execSync(`docker exec ${container.id} ls /workspace/skills/`, { encoding: 'utf-8' });
+    assert.ok(skillsList.includes('slack'), 'worker should have slack skill');
+    assert.ok(skillsList.includes('admin'), 'worker should have admin skill');
+
+    // Root-only skills should NOT exist
+    assert.ok(!skillsList.includes('spawn-agent'), 'worker should NOT have spawn-agent skill');
+    assert.ok(!skillsList.includes('self-update'), 'worker should NOT have self-update skill');
+
+    // Base shared tools should exist
+    const toolsList = execSync(`docker exec ${container.id} ls /workspace/scripts/tools/`, { encoding: 'utf-8' });
+    assert.ok(toolsList.includes('bash.js'), 'should have bash tool');
+    assert.ok(toolsList.includes('read-file.js'), 'should have read-file tool');
+    assert.ok(toolsList.includes('write-file.js'), 'should have write-file tool');
+  });
+
+  it('role template: root workspace has correct skills and config', async () => {
+    const rootWs = '/workspace-root-template-test';
+    const rootPort = 3197;
+
+    // Start a root agent (SPAWN_WORKER=true)
+    execSync(
+      `docker exec -d -e SPAWN_WORKER=true ${container.id} sh -c "PORT=${rootPort} node /app/dist/agent.js ${rootWs}"`,
+      { timeout: 5_000 }
     );
-    assert.ok(repairHistoryExists, 'repair history should be saved');
+
+    // Wait for agent to start
+    const deadline = Date.now() + 10_000;
+    let ready = false;
+    while (Date.now() < deadline) {
+      try {
+        const res = execSync(
+          `docker exec ${container.id} curl -sf http://localhost:${rootPort}/status`,
+          { encoding: 'utf-8', timeout: 2_000 }
+        );
+        if (res.includes('status')) { ready = true; break; }
+      } catch { /* not ready yet */ }
+      await sleep(500);
+    }
+    assert.ok(ready, 'root agent should become ready');
+
+    // Check agent.json
+    const agentJson = JSON.parse(dockerReadFile(container.id, `${rootWs}/agent.json`));
+    assert.equal(agentJson.role, 'root', 'agent.json should have role: root');
+
+    // Check prompt.md
+    const promptMd = dockerReadFile(container.id, `${rootWs}/prompt.md`);
+    assert.ok(promptMd.includes('Root Coordinator'), 'prompt.md should contain Root Coordinator');
+    assert.ok(!promptMd.includes('Worker Agent'), 'prompt.md should NOT contain Worker Agent');
+
+    // Root skills should exist
+    const skillsList = execSync(`docker exec ${container.id} ls ${rootWs}/skills/`, { encoding: 'utf-8' });
+    assert.ok(skillsList.includes('spawn-agent'), 'root should have spawn-agent skill');
+    assert.ok(skillsList.includes('self-update'), 'root should have self-update skill');
+
+    // Worker-only skills should NOT exist
+    assert.ok(!skillsList.includes('slack'), 'root should NOT have slack skill');
+    assert.ok(!skillsList.includes('admin'), 'root should NOT have admin skill');
+
+    // Clean up: kill the root agent process
+    execSync(
+      `docker exec ${container.id} sh -c "ps aux | grep 'workspace-root-template-test' | grep -v grep | awk '{print \\$2}' | xargs kill 2>/dev/null || true"`,
+      { timeout: 5_000 }
+    );
+  });
+
+  it('role template: inherited root state resets to worker role with correct skills', async () => {
+    const ws = '/workspace-role-reset-test';
+    const testPort = 3196;
+
+    // Create a workspace that simulates a clone from root agent
+    execSync(
+      `docker exec ${container.id} sh -c "` +
+        `mkdir -p ${ws}/memory ${ws}/history ${ws}/outbox ${ws}/skills && ` +
+        `cp -r /workspace/scripts ${ws}/ && ` +
+        `echo '{}' > ${ws}/routes.json && ` +
+        `echo '[]' > ${ws}/memory/context.json"`,
+      { timeout: 5_000 }
+    );
+
+    // Write agent.json with role: root and round > 0 (simulating cloned root state)
+    execSync(
+      `docker exec ${container.id} node -e "` +
+        `const fs = require('fs'); ` +
+        `const state = JSON.parse(fs.readFileSync('/workspace/agent.json', 'utf-8')); ` +
+        `state.role = 'root'; ` +
+        `state.round = 5; ` +
+        `fs.writeFileSync('${ws}/agent.json', JSON.stringify(state, null, 2))"`,
+      { timeout: 5_000 }
+    );
+
+    // Copy root skills and prompt (simulating cloned root workspace)
+    execSync(
+      `docker exec ${container.id} sh -c "` +
+        `cp -r /app/roles/root/skills/* ${ws}/skills/ && ` +
+        `cp /app/roles/root/prompt.md ${ws}/prompt.md"`,
+      { timeout: 5_000 }
+    );
+
+    // Verify pre-conditions
+    const beforeAgent = JSON.parse(dockerReadFile(container.id, `${ws}/agent.json`));
+    assert.equal(beforeAgent.role, 'root', 'pre-condition: should have root role');
+    const beforeSkills = execSync(`docker exec ${container.id} ls ${ws}/skills/`, { encoding: 'utf-8' });
+    assert.ok(beforeSkills.includes('spawn-agent'), 'pre-condition: should have spawn-agent skill');
+
+    // Start agent WITHOUT SPAWN_WORKER (worker that inherited root state)
+    execSync(
+      `docker exec -d ${container.id} sh -c "PORT=${testPort} node /app/dist/agent.js ${ws}"`,
+      { timeout: 5_000 }
+    );
+
+    // Wait for agent to start (boot guard runs synchronously before server)
+    const deadline = Date.now() + 10_000;
+    let ready = false;
+    while (Date.now() < deadline) {
+      try {
+        const res = execSync(
+          `docker exec ${container.id} curl -sf http://localhost:${testPort}/status`,
+          { encoding: 'utf-8', timeout: 2_000 }
+        );
+        if (res.includes('status')) { ready = true; break; }
+      } catch { /* not ready yet */ }
+      await sleep(500);
+    }
+    assert.ok(ready, 'agent should become ready after role reset');
+
+    // agent.json should be reset to worker
+    const afterAgent = JSON.parse(dockerReadFile(container.id, `${ws}/agent.json`));
+    assert.equal(afterAgent.role, 'worker', 'agent.json role should be reset to worker');
+    assert.equal(afterAgent.round, 0, 'round should be reset to 0');
+
+    // prompt.md should be overwritten with worker content
+    const promptMd = dockerReadFile(container.id, `${ws}/prompt.md`);
+    assert.ok(promptMd.includes('Worker Agent'), 'prompt.md should have worker content after reset');
+    assert.ok(!promptMd.includes('Root Coordinator'), 'prompt.md should NOT have root content after reset');
+
+    // Skills should be replaced with worker skills
+    const afterSkills = execSync(`docker exec ${container.id} ls ${ws}/skills/`, { encoding: 'utf-8' });
+    assert.ok(afterSkills.includes('slack'), 'should have slack skill after reset');
+    assert.ok(afterSkills.includes('admin'), 'should have admin skill after reset');
+    assert.ok(!afterSkills.includes('spawn-agent'), 'should NOT have spawn-agent skill after reset');
+    assert.ok(!afterSkills.includes('self-update'), 'should NOT have self-update skill after reset');
+
+    // Context should be cleared
+    const ctx = JSON.parse(dockerReadFile(container.id, `${ws}/memory/context.json`));
+    assert.deepEqual(ctx, [], 'context should be empty after role reset');
+
+    // Clean up
+    execSync(
+      `docker exec ${container.id} sh -c "ps aux | grep 'workspace-role-reset-test' | grep -v grep | awk '{print \\$2}' | xargs kill 2>/dev/null || true"`,
+      { timeout: 5_000 }
+    );
+  });
+
+  it('role template: system prompt includes role-specific content from prompt.md', async () => {
+    await clearOutbox(container.baseUrl);
+    const { body: status } = await httpGet(container.baseUrl, '/status');
+    const startRound = status.round;
+
+    await httpPost(container.baseUrl, '/message', {
+      content: 'ROLE_PROMPT_TEST please',
+      source: 'test-role-prompt:1',
+    });
+
+    await pollRound(container.baseUrl, startRound + 1, 15_000);
+
+    const outbox = await pollOutbox(container.baseUrl, 1, 5_000);
+    const reply = outbox.find((m: any) => m.source === 'test-role-prompt:1');
+    assert.ok(reply, 'should have reply from role prompt test');
+    assert.ok(
+      reply.content.includes('worker=true'),
+      `system prompt should include Worker Agent content from prompt.md, got: ${reply.content}`
+    );
+    assert.ok(
+      reply.content.includes('workspace=true'),
+      `system prompt should include workspace path, got: ${reply.content}`
+    );
   });
 });

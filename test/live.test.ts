@@ -8,7 +8,7 @@ import {
   waitForReady,
   httpGet,
   httpPost,
-  pollBridgeReply,
+  pollAdminReply,
   dockerReadFile,
   dockerLogs,
   type ContainerInfo,
@@ -51,7 +51,7 @@ describe(`protocells live tests (${providerName})`, () => {
     });
     await waitForReady(container.baseUrl);
     // Also wait for bridge to be ready
-    await waitForReady(container.bridgeUrl);
+    await waitForReady(container.adminUrl, 15_000, '/api/status');
   });
 
   after(() => {
@@ -65,9 +65,9 @@ describe(`protocells live tests (${providerName})`, () => {
     }
   });
 
-  it('agent replies through mock-im bridge', async () => {
+  it('agent replies through admin dashboard', async () => {
     // Send message through bridge (like a real IM user would)
-    const { status, body } = await httpPost(container.bridgeUrl, '/send', {
+    const { status, body } = await httpPost(container.adminUrl, '/api/send', {
       session: sessionId,
       content: 'Say exactly: "Hello from protocells!" and nothing else.',
     });
@@ -75,7 +75,7 @@ describe(`protocells live tests (${providerName})`, () => {
     assert.ok(body.ok);
 
     // Poll bridge for agent's reply (agent should read skill and use bash+curl)
-    const reply = await pollBridgeReply(container.bridgeUrl, sessionId, 120_000);
+    const reply = await pollAdminReply(container.adminUrl, sessionId, 120_000);
     assert.ok(reply.content, 'reply should have content');
     assert.ok(reply.content.length > 0, 'reply content should not be empty');
     console.log(`[live test] agent replied via bridge: ${reply.content.slice(0, 200)}`);
@@ -99,8 +99,8 @@ describe(`protocells live tests (${providerName})`, () => {
 
   it('bridge received the message flow', async () => {
     const { body: messages } = await httpGet(
-      container.bridgeUrl,
-      `/messages?session=${sessionId}`
+      container.adminUrl,
+      `/api/messages?session=${sessionId}`
     );
     assert.ok(Array.isArray(messages));
     assert.ok(messages.length >= 2, 'should have at least user + assistant messages');
